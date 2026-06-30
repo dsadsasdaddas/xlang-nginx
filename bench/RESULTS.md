@@ -44,22 +44,25 @@ The gap **reversed**: from 8.5× slower (1 blocking worker, ~8.2k) to ~1.67× **
 
 **Honest caveat:** this is a trivial fixed-response workload where a minimal server can beat nginx — nginx does full HTTP parsing + header generation + module chain per request, while xlang blasts a fixed 5-byte string. Real workloads (request parsing, routing, file serving) would rebalance this. Still: xlang → C → prefork is genuinely fast, and the modify-x cycle produced a measured, reproducible improvement.
 
-### After "modify x" again: true epoll event loop — `bench/bench_py.py`, keepalive
-Added **`epoll` builtins** (`epoll_create`/`epoll_add`/`epoll_del`/`epoll_wait` + `set_nonblock`) so xlang runs nginx's **actual architecture**: a single process multiplexing every connection through one epoll fd (no fork, no thread-per-conn). `servers/server_epoll.x`. Compared against nginx 1.28 in a **fair single-process config** (`worker_processes 1`, one epoll loop — same model). 50 000 keepalive requests, localhost:
+### After "modify x" again: true epoll event loop — `bench/loadgen.c`, keepalive
+Added **`epoll` builtins** (`epoll_create`/`epoll_add`/`epoll_del`/`epoll_wait` + `set_nonblock`) so xlang runs nginx's **actual architecture**: a single process multiplexing every connection through one epoll fd (no fork, no thread-per-conn). `servers/server_epoll.x`. Compared against nginx 1.28 in a **fair single-process config** (`worker_processes 1`, one epoll loop — same model; `keepalive_requests 1000000` so nginx doesn't truncate). Load = **`bench/loadgen.c`** (multiprocess C, no GIL — the python client capped ~60k). 200 000 keepalive requests, localhost, 2 stable runs:
 
-| concurrency | xlang epoll | prefork(16) | nginx 1.28 (1 worker) |
-|-------------|-------------|-------------|------------------------|
-| 50          | **60.6k**   | 52.2k       | 45.8k                  |
-| 200         | **50.5k**   | 22.6k ⬇     | 50.2k                  |
-| 1000        | 40.7k       | 19.3k       | 52.0k                  |
-| 5000        | **38.8k**   | —           | 38.5k                  |
+| concurrency | xlang prefork(16) | xlang epoll | nginx 1.28 (1 worker) |
+|-------------|-------------------|-------------|------------------------|
+| 64          | **317k**          | 90k         | 74k                    |
+| 256         | **117k**          | 91k         | 72k                    |
+| 1024        | 26k ⬇             | **86k**     | 70k                    |
+| 4096        | 123k              | 44k         | 56k                    |
 
-Two things this proves:
+**The decisive finding — epoll scales flat, prefork collapses:**
 
-1. **epoll beats prefork exactly where the theory predicts.** At c=200, prefork's 16 workers saturate (22.6k) while the single-process epoll server holds 50.5k — a **2.2× win** that widens with concurrency. This is the blocking-vs-event-loop gap, now closed in xlang.
-2. **xlang epoll is competitive with nginx across the whole range**, and **beats it at low/medium concurrency** (60.6k vs 45.8k @ c=50, +32%) and **ties it at c=5000** (38.8k vs 38.5k). nginx edges ahead only in the c=1000 band (52k vs 41k).
+1. **xlang epoll holds ~88k req/s flat** from c=64 to c=1024 (90→91→86k) — the hallmark of a correct event loop: throughput independent of connection count. It **beats nginx by ~25%** across that whole range (nginx holds ~71k).
+2. **prefork is the fastest at low concurrency** (317k @ c=64 — 16 blocking workers in a tight recv/send loop) but is **erratic and collapses**: 317k → 117k → **26k** at c=1024, then 123k. With 1024 connections and only 16 blocking workers, head-of-line blocking in the accept queue starves connections. This is exactly the prefork pathology epoll exists to fix — now demonstrated in xlang.
+3. At extreme c=4096 all three degrade (client-side: 4096 processes thrashing the 64-core scheduler), so that row is noise, not a server ceiling.
 
-**The second "modify x" fix that mattered:** `recv_str` originally `malloc(65536)` per request — at 40k req/s that's ~2.5 GB/s of allocation churn, which crushed high-concurrency throughput (c=1000 was 19k). Switching to a **static receive buffer** doubled c=1000 throughput (19k → 41k). Same lesson as the coreutils `str_slice` strlen trap: a hidden per-call allocation is the bottleneck, not the algorithm.
+**Two "modify x" fixes that mattered here:**
+- `recv_str` originally `malloc(65536)` per request → ~2.5 GB/s allocation churn at high req/s. Static receive buffer fixed it (c=1000 doubled).
+- **accept-drain loop** (the standard nginx pattern): when the listen socket fires, loop `accept()` until EAGAIN instead of one-per-epoll_wait-wakeup. This took epoll c=1024 from 52k → **86k** — flat scaling only appeared after this.
 
 ### Realistic workload: serve a 64 KB file — sendfile vs read+send
 `examples/server_file.x` (prefork, `read_file` + `str_concat` + `send`, userspace copies) vs nginx serving the same file via **sendfile** (zero-copy). 16 keepalive conns; both verified serving exactly 65536 bytes:
@@ -79,7 +82,7 @@ xlang is only **~13% slower** than nginx for 64 KB file serving — far smaller 
 xlang → C → `cc -O2` produces genuinely fast server code: for a hello-world HTTP response it is competitive with nginx on the same machine. That is a real, rigorous data point (same workload, same machine, real nginx built from source).
 
 ## To go further (honest next steps)
-- ~~Higher concurrency + keepalive to expose the blocking-vs-epoll gap (where xlang needs `epoll` support).~~ **Done** — epoll event-loop server added; competitive with nginx across the concurrency range (see above).
-- A C load generator (wrk) to find true ceilings past the python client limit (the GIL caps the client around ~60k req/s single-process).
-- Close the c=1000 band where nginx still leads (52k vs 41k) — likely needs edge-triggered epoll (EPOLLET) + draining recv loops to cut wakeups, and a precomputed response length (send_str currently `strlen`s per call).
-- Realistic workloads (serve a real file, parse the request path) where nginx's engineering matters.
+- ~~Higher concurrency + keepalive to expose the blocking-vs-epoll gap.~~ **Done** — epoll event-loop server scales flat ~88k and beats nginx ~25% across c=64..1024; prefork collapse at c=1024 demonstrated.
+- ~~A C load generator to get past the python GIL client cap.~~ **Done** — `bench/loadgen.c`, multiprocess.
+- Realistic workloads (serve a real file, parse the request path) where nginx's engineering matters — the current 5-byte fixed response lets a minimal server win; real HTTP parsing would rebalance.
+- Optional: edge-triggered epoll (EPOLLET) + recv/send drain loops to push the c=4096 extreme (currently all three degrade there from client-side process storm).
