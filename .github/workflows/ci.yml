@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  servers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout xlang-nginx
+        uses: actions/checkout@v4
+
+      - name: Clone xlang compiler
+        run: git clone --depth 1 https://github.com/dsadsasdaddas/xlang /tmp/xlang
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build xlangc
+        run: cargo build --release
+        working-directory: /tmp/xlang
+
+      # Compile every server (.x -> C) and cc it to an object. The networking
+      # preamble (epoll/sendfile/...) is active on Linux, so this is a real
+      # compile check. Servers are event loops (run forever) so we don't run them.
+      - name: Compile every server (.x -> C -> object)
+        run: |
+          set -e
+          XLANGC=/tmp/xlang/target/release/xlangc
+          mkdir -p build
+          pass=0
+          for f in servers/*.x; do
+            stem=$(basename "$f" .x)
+            "$XLANGC" c "$f"
+            cc -O2 -c "build/$stem.c" -o "build/$stem.o"
+            pass=$((pass + 1))
+          done
+          echo "::notice::compiled $pass servers (.x -> C -> object) OK"
+
+      - name: Compile the C load generator
+        run: cc -O2 -c bench/loadgen.c -o build/loadgen.o
