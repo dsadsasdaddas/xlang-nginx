@@ -84,5 +84,18 @@ xlang → C → `cc -O2` produces genuinely fast server code: for a hello-world 
 ## To go further (honest next steps)
 - ~~Higher concurrency + keepalive to expose the blocking-vs-epoll gap.~~ **Done** — epoll event-loop server scales flat ~88k and beats nginx ~25% across c=64..1024; prefork collapse at c=1024 demonstrated.
 - ~~A C load generator to get past the python GIL client cap.~~ **Done** — `bench/loadgen.c`, multiprocess.
-- Realistic workloads (serve a real file, parse the request path) where nginx's engineering matters — the current 5-byte fixed response lets a minimal server win; real HTTP parsing would rebalance.
+- ~~Realistic workload: serve a real file, parse the request path.~~ **Done** — `servers/server_web.x` (epoll + request parse + sendfile); competitive with nginx (see below).
 - Optional: edge-triggered epoll (EPOLLET) + recv/send drain loops to push the c=4096 extreme (currently all three degrade there from client-side process storm).
+
+### Realistic workload: HTTP file server — `servers/server_web.x`, `bench/http_load.c`
+A real web server on the epoll loop: parses the request line (`GET /path HTTP/1.1`), maps `/` → `index.html`, serves the file with Content-Type/Length + 200 (or 404), keepalive. File bodies go out via **sendfile** (zero-copy, like nginx). Same webroot served by nginx 1.28 (single worker) for a fair comparison. `bench/http_load.c` = multiprocess keepalive C client that parses Content-Length. c=64:
+
+| file | xlang | nginx 1.28 | result |
+|------|-------|------------|--------|
+| `/` (52 B)     | 36.3k req/s | 39.2k | tied (93%) |
+| `/mid.txt` (13 KB) | 31.1k | 39.6k | 79% |
+| `/big.txt` (1.3 MB) | **3.1k** | 1.3k | **2.4× faster** |
+
+Content verified byte-identical to nginx. xlang is **within 80–93% of nginx for small/medium files** and **2.4× faster for large files** (sendfile zero-copy + minimal per-request machinery vs nginx's full pipeline).
+
+**The bug that took this from 24 req/s → 36k req/s (1500×):** Nagle + delayed ACK. The server sends response **headers** (send_str) then the **body** (sendfile) — two sends. Without `TCP_NODELAY`, Nagle holds the second packet waiting for the first's ACK, and the keepalive client uses Linux's delayed-ACK (~40 ms). So every small-file request stalled ~40 ms → 24 req/s. Added `set_nodelay` builtin (TCP_NODELAY on each client socket) → 36k. (Large files were never affected — the continuous sendfile stream keeps ACKs flowing, so no Nagle stall; they were already 2.4× nginx.) This is the same class of "hidden per-request latency" trap as the coreutils `str_slice` strlen and the `recv_str` malloc.
