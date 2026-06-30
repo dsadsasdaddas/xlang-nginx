@@ -85,12 +85,10 @@ fn main(): i32 {
                 if client < 0 {
                     break
                 }
-                // Client sockets stay BLOCKING: send/sendfile of file bodies must
-                // complete in full. With non-blocking sockets, sendfile returns
-                // EAGAIN when the send buffer fills (large files) and our helper
-                // treats that as "done", truncating the response and deadlocking
-                // the keepalive client. Blocking = simple correct backpressure.
-                // (Trade-off: a slow client can head-of-line-block the loop.)
+                // Non-blocking client: fast event loop. Large file bodies go out
+                // via sendfile_fd which retries on EAGAIN (completes in full), so
+                // non-blocking no longer truncates responses.
+                set_nonblock(client)
                 epoll_add(client)
             }
         } else {
