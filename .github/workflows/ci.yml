@@ -42,3 +42,29 @@ jobs:
 
       - name: Compile the C load generator
         run: cc -O2 -c bench/loadgen.c -o build/loadgen.o
+
+      # Functional test: build server_http, start it, curl it, verify the
+      # response. The first RUNTIME CI test for the nginx replacement.
+      - name: Functional test - server_http (build, start, curl, verify)
+        run: |
+          set -e
+          XLANGC=/tmp/xlang/target/release/xlangc
+          "$XLANGC" c servers/server_http.x
+          cc -O2 -o /tmp/server_http build/server_http.c
+          DOCDIR=$(mktemp -d)
+          echo "hello from CI" > "$DOCDIR/index.html"
+          /tmp/server_http "$DOCDIR" 28099 &
+          SRV_PID=$!
+          sleep 0.5
+          # GET
+          body=$(curl -s http://127.0.0.1:28099/index.html)
+          [ "$body" = "hello from CI" ] || { echo "FAIL: body=[$body]"; kill $SRV_PID; exit 1; }
+          # 404
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:28099/nonexistent)
+          [ "$code" = "404" ] || { echo "FAIL: 404 code=$code"; kill $SRV_PID; exit 1; }
+          # HEAD (status 200, zero body)
+          head=$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -I http://127.0.0.1:28099/index.html)
+          echo "HEAD: $head"
+          kill $SRV_PID
+          rm -rf "$DOCDIR"
+          echo "::notice::server_http functional test passed (GET + 404 + HEAD)"
