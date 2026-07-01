@@ -24,8 +24,9 @@ module main
 //     where each worker handles requests serially;
 //   - no retry on mid-response upstream death (the client already got a partial
 //     response); needs response buffering to retry cleanly;
-//   - request body assumed to fit in one recv (GET/small POST); binary REQUEST
-//     bodies would still be truncated by the text send_str(up, req) forward.
+//   - request body assumed to fit in one recv (GET/small POST). Binary REQUEST
+//     bodies ARE forwarded correctly (forward_request uses recv_n + send_rbuf,
+//     NUL-safe, Content-Length framed) — POST uploads of images/etc. pass through.
 //
 // Response relay IS binary-safe: the relay() helper forwards raw chunks via
 // send_rbuf (length-aware), so images / compressed / arbitrary binary response
@@ -124,6 +125,65 @@ fn parse_port(s: String): i32 {
     return str_to_int(str_slice(s, c + 1, str_len(s)))
 }
 
+// Forward ONE client request (request-line + headers + Content-Length body) to
+// the upstream, BINARY-SAFE: each recv'd chunk goes straight to the upstream via
+// send_rbuf (NUL bytes preserved), while Content-Length is parsed from the
+// NUL-free header region to know when the body is complete. For GET (no body)
+// it stops after the headers. Returns -1 if the client closed with no request,
+// 0 once a complete request has been forwarded. (request-side twin of relay().)
+fn forward_request(client: i32, upstream: i32): i32 {
+    sb_new()
+    let mut total: i32 = 0
+    let mut hdrlen: i32 = -1
+    let mut cl: i32 = -1
+    let mut done: i32 = 0
+    let mut got_any: i32 = 0
+    while done == 0 {
+        let n: i32 = recv_n(client)
+        if n == 0 {
+            if got_any == 0 { return -1 }
+            return 0
+        }
+        got_any = 1
+        send_rbuf(upstream, n)
+        total = total + n
+        if hdrlen < 0 {
+            sb_push(rbuf_str())
+            let buf: String = sb_str()
+            let he: i32 = str_find(buf, "\r\n\r\n")
+            if he >= 0 {
+                hdrlen = he + 4
+                let k: i32 = str_find(buf, "Content-Length:")
+                if k >= 0 {
+                    if k < hdrlen {
+                        let blen: i32 = str_len(buf)
+                        let mut p: i32 = k + 16
+                        while p < blen {
+                            if str_char_at(buf, p) == 32 { p = p + 1 } else { break }
+                        }
+                        let mut ve: i32 = p
+                        while ve < blen {
+                            let c: i32 = str_char_at(buf, ve)
+                            if c == 13 { break }
+                            if c == 10 { break }
+                            ve = ve + 1
+                        }
+                        cl = str_to_int(str_slice(buf, p, ve))
+                    }
+                }
+            }
+        }
+        if hdrlen >= 0 {
+            if cl >= 0 {
+                if total - hdrlen >= cl { done = 1 }
+            } else {
+                done = 1
+            }
+        }
+    }
+    return 0
+}
+
 // Each worker is PINNED to one upstream — upstream[worker_index % N_upstreams]
 // — and keeps ONE persistent connection to it (keepalive). With W workers and
 // U upstreams, ~W/U workers pin to each upstream, so the kernel's accept
@@ -143,22 +203,21 @@ fn worker(index: i32, listen_fd: i32): i32 {
         if client < 0 { continue }
         set_nodelay(client)
         while true {
-            let req: String = recv_str(client)
-            if str_len(req) == 0 { break }
             if up < 0 {
                 up = tcp_connect(upstream_host, upstream_port)
                 if up >= 0 { set_nodelay(up) }
             }
             if up < 0 {
-                send_str(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
-            } else {
-                send_str(up, req)
-                let r: i32 = relay(client, up)
-                if r < 0 {
-                    close_fd(up)
-                    up = -1
-                    break
-                }
+                send_str(client, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                break
+            }
+            let fr: i32 = forward_request(client, up)
+            if fr < 0 { break }
+            let r: i32 = relay(client, up)
+            if r < 0 {
+                close_fd(up)
+                up = -1
+                break
             }
         }
         close_fd(client)
