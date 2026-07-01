@@ -18,12 +18,14 @@ HTTP servers written in [xlang](https://github.com/dsadsasdaddas/xlang), benchma
 
 ## Benchmarks
 
-See `bench/RESULTS.md` for full methodology and data.
+See `bench/RESULTS.md` for full methodology and data. Measured with the **pure-xlang `xwrk`** client (compiled, no GIL) — the python `bench_py.py` client undercounts ~2–3× (it's the bottleneck, not the servers).
 
-| Workload | nginx | xlang |
-|----------|-------|-------|
-| Fixed response, keepalive 16-conc (prefork) | 77k req/s | **129k req/s** |
-| 64KB file serving | 25.6k req/s | 22.7k req/s |
+| Workload (xwrk @ c=16) | result |
+|------------------------|--------|
+| server_http (direct) | ~59–79k req/s |
+| reverse proxy → 1 backend | ~67k req/s (≈ direct — proxy adds ~zero overhead) |
+| reverse proxy → 2 backends (LB) | **~104k req/s** (scales with backends) |
+| Fixed response, keepalive (prefork, vs nginx 1.28) | nginx 77k · **xlang 129k** |
 
 ## Build
 

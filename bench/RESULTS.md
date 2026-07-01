@@ -109,7 +109,7 @@ Same lesson across the whole project: a single hidden per-request cost (str_slic
 
 `servers/server_http.x` is the most feature-complete server: full HTTP/1.1 request-line parse (METHOD / PATH / VERSION), header lookup (`header_value`), method routing (**GET** serves body, **HEAD** serves headers only with correct Content-Length, anything else → **405**), **Range / `206 Partial Content`** with `Content-Range` (uses the new `sendfile_range` builtin to sendfile from an offset), path-traversal **403**, **404**, access logging, and keep-alive. `bench/http_test.sh` is a 19-case curl functional suite (GET, HEAD, three Range shapes incl. suffix, bad range, 404/405/403, subdir, sequential keepalive) — all pass on the wzu box.
 
-**Benchmark** (`bench/http_bench.sh`, `bench_py.py` keepalive load gen, 30 000 reqs each, localhost):
+**Benchmark** (`bench/http_bench.sh`, `bench_py.py` keepalive load gen, 30 000 reqs each, localhost). ⚠️ These are **client-bottlenecked** (python GIL caps the client at ~25–28k; see the proxy-section measurement correction). They're useful for *relative* comparison (same client throughout), but undercount absolute capacity ~2–3×. The accurate `xwrk` client measures `server_http` direct at **~59–79k req/s @ c=16**.
 
 | server | c=1 | c=16 | c=64 |
 |--------|-----|------|------|
@@ -133,14 +133,16 @@ The most common nginx use case: sit in front of a backend and forward requests. 
 
 `bench/proxy_test.sh` (8 cases, all pass on wzu): GET body matches direct, Range `206` + partial body relayed, 404 relayed, and a ~170 KB **multi-recv** text file relayed byte-identical to both direct and the on-disk source.
 
-**Benchmark** (`bench/proxy_bench.sh`, keepalive, 30000 reqs, 6-byte index.html):
+**Benchmark** — ⚠️ **measurement correction.** The earlier numbers (below, from `bench_py.py`) were **client-bottlenecked**: the python load generator's GIL capped measurements at ~25–28k req/s for *both* direct and proxied, which falsely made the proxy look like the ceiling. The pure-xlang `xwrk` client (compiled C, no GIL) reveals the truth — `bench/xwrk_bench.sh`, c=16, 3s:
 
-| target | c=1 | c=16 | c=64 |
-|--------|-----|------|------|
-| direct (server_http) | 12.7k | 25.8k | 24.8k |
-| **proxy → direct** | 4.7k | **26.2k** | **26.5k** |
+| target (xwrk, accurate) | req/s |
+|------------------------|-------|
+| server_http (direct)   | ~59–79k (run-to-run; box load) |
+| **proxy → 1 backend**  | **~67k** (≈ direct — the keepalive proxy adds ~zero overhead) |
 
-After adding **upstream keepalive** (each worker reuses ONE persistent upstream connection instead of a fresh `tcp_connect` per request), the proxy **matches or beats direct at c≥16** (was ~60% of direct before). The per-request TCP connect — previously the dominant overhead — is now amortized across thousands of requests per worker. c=1 stays hop-bound (~37% of direct): a proxy is inherently a double-hop, and at single-connection latency there's no concurrency to hide it. Two costs remain: the recv/send relay hop, and (for the rare mid-response upstream death) a dropped connection (no clean retry without response buffering).
+So the reverse proxy is **NOT a bottleneck** — with upstream keepalive it matches the backend. The per-request `tcp_connect` (the old prefork overhead) is fully amortized. (The earlier "proxy hop-bound at c=1" / "~60% of direct" claims were python-client artifacts too.) c=1 is still hop-bound in absolute terms (a proxy is a double-hop), but the proxy no longer caps concurrency-saturated throughput.
+
+Old `bench_py.py` numbers (kept for the record; ~2–3× undercounts): direct 25.8k, proxy 26.2k @ c=16.
 
 ### Load balancing — multiple upstreams (nginx `upstream {}`)
 
@@ -148,7 +150,7 @@ After adding **upstream keepalive** (each worker reuses ONE persistent upstream 
 
 **Distribution** (`bench/lb_test.sh`, 2 backends serving "A"/"B", 200 requests): **A=101, B=99** — essentially ideal 50/50. All 4 checks pass.
 
-**Throughput** (`bench/lb_bench.sh`, c=16): 1 backend = 27.0k req/s, 2 backends = 21.5k req/s. With these *fast* static backends the **proxy itself is the bottleneck** (~27k, single-process epoll backends are faster still), so adding backends doesn't raise raw req/s here. LB pays off when a single backend is the limiter (slow app servers) — that's exactly the nginx use case it mirrors — and it always provides redundancy/failover. (Pushing proxy throughput further would mean an epoll event-loop proxy instead of prefork.)
+**Throughput** (`bench/xwrk_bench.sh`, xwrk client, c=16, accurate): **1 backend ≈ 67k → 2 backends ≈ 104k req/s** — load balancing **scales** (+55%, heading toward 2× as the proxy overhead amortizes). (The earlier `bench/lb_bench.sh` showed 2 backends *slower* than 1 — that was entirely the python-client artifact; with an accurate client, LB clearly pays off even for fast static backends.) LB also always provides redundancy/failover, and pays off most when a single backend is the limiter (slow app servers — the canonical nginx use case).
 
 
 **Known limitation — binary REQUEST bodies:** the response relay is now binary-safe (see below), but the *request* forward (`send_str(up, req)`) is still C-string-based, so a binary request body (e.g. a POST upload with NUL bytes) would be truncated. GET proxying and text POSTs are fine.
