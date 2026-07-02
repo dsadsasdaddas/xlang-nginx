@@ -1,14 +1,15 @@
 module main
 
 // server_http <docroot> [port] — HTTP/1.1 file server with method routing,
-// Range/partial-content (206), HEAD, and proper keep-alive.
+// Range/partial-content (206), HEAD, POST upload, and proper keep-alive.
 //
 // Beyond server_pro:
 //   - Parses the request line into METHOD / PATH / VERSION.
 //   - Header lookup (Host, Connection, Range) via header_value().
 //   - GET serves the body; HEAD serves headers only (Content-Length correct, no body).
+//   - POST writes the request body to docroot+path (201 Created) — a minimal upload.
 //   - Range: bytes=... → 206 Partial Content + Content-Range (sendfile_range).
-//   - Only GET/HEAD allowed → otherwise 405 Method Not Allowed.
+//   - GET/HEAD/POST allowed → otherwise 405 Method Not Allowed.
 //   - 404 Not Found, 403 Forbidden (path traversal), 416-style → 200 full on bad range.
 //   - Access log to stdout: "METHOD PATH STATUS BYTES" (redirect to /dev/null when benching).
 
@@ -41,6 +42,15 @@ fn parse_method(req: String): String {
     let sp: i32 = str_find(req, " ")
     if sp < 0 { return "" }
     return str_slice(req, 0, sp)
+}
+
+// Request body = everything after the blank line ("\r\n\r\n") separating
+// headers from body. recv_str reads one recv() (up to 64 KiB), so for small
+// POST bodies (headers + body in one packet) this captures the full body.
+fn parse_body(req: String): String {
+    let idx: i32 = str_find(req, "\r\n\r\n")
+    if idx < 0 { return "" }
+    return str_slice(req, idx + 4, str_len(req))
 }
 
 // Path = token between first and second space; "/index.html" for "/".
@@ -247,10 +257,30 @@ fn handle(fd: i32, docroot: String, req: String): i32 {
     // Prefix-check the method (avoids a per-request str_slice for routing).
     let is_get: i32 = str_starts_with(req, "GET ")
     let is_head: i32 = str_starts_with(req, "HEAD ")
+    let is_post: i32 = str_starts_with(req, "POST ")
+    // POST: write the request body to docroot+path (a minimal upload), then
+    // 201 Created. Path traversal is blocked by sanitize_path (same as GET).
+    if is_post == 1 {
+        if sanitize_path(mpath) < 0 {
+            send_str(fd, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+            log_line("POST", mpath, 403, 0)
+            return 0
+        }
+        let body: String = parse_body(req)
+        let target: String = str_concat(docroot, mpath)
+        write_file(target, body)
+        let blen: i32 = str_len(body)
+        send_str(fd, "HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: ")
+        send_str(fd, int_to_str(blen))
+        send_str(fd, "\r\nConnection: keep-alive\r\n\r\n")
+        send_str(fd, body)
+        log_line("POST", mpath, 201, blen)
+        return 0
+    }
     if is_get == 0 {
         if is_head == 0 {
             let m: String = parse_method(req)
-            send_str(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+            send_str(fd, "HTTP/1.1 405 Method Not Allowed\r\nAllow: GET, HEAD, POST\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
             log_line(m, mpath, 405, 0)
             return 0
         }

@@ -65,9 +65,16 @@ jobs:
           # HEAD (status 200, zero body)
           head=$(curl -s -o /dev/null -w '%{http_code} %{size_download}' -I http://127.0.0.1:28099/index.html)
           echo "HEAD: $head"
+          # POST upload (write body to a file), then GET it back — round-trip.
+          post_body="uploaded content 12345"
+          post_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$post_body" http://127.0.0.1:28099/upload.txt)
+          [ "$post_code" = "201" ] || { echo "FAIL: POST code=$post_code"; kill $SRV_PID; exit 1; }
+          rb=$(curl -s http://127.0.0.1:28099/upload.txt)
+          [ "$rb" = "$post_body" ] || { echo "FAIL: POST roundtrip body=[$rb]"; kill $SRV_PID; exit 1; }
+          echo "POST upload + GET roundtrip OK"
           kill $SRV_PID
           rm -rf "$DOCDIR"
-          echo "::notice::server_http functional test passed (GET + 404 + HEAD)"
+          echo "::notice::server_http functional test passed (GET + 404 + HEAD + POST)"
 
       # Functional test for the reverse proxy: start a backend, start the proxy,
       # curl through the proxy, verify the response is relayed.
